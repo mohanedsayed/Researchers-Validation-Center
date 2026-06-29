@@ -1720,468 +1720,46 @@ git commit -m "feat: add GET /sessions/{id} and GET /sessions/{id}/chunks endpoi
 
 ---
 
-## Task 9: Ollama Chunker Service
+## Task 9: External Chunker Worker Integration (Temporal)
 
-**Files:**
-- Create: `backend/app/services/chunker.py`
-- Create: `backend/tests/test_chunker.py`
+**Description:**
+Instead of building the chunker inside the main backend, we will integrate with the external `semantic_chunker` repository via a Temporal worker.
 
-- [ ] **Step 9.1: Write failing test `backend/tests/test_chunker.py`**
+- [ ] **Step 9.1: Configure Temporal connection in backend**
+Add Temporal client initialization to FastAPI lifecycle so the backend can submit workflows.
 
-```python
-import pytest
+- [ ] **Step 9.2: Create Temporal Worker in Chunker Repo**
+In the external `Chunker` repo, create a Temporal worker (`worker.py`) that listens to a specific task queue (e.g. `chunker-task-queue`).
+It will expose an activity `chunk_document_activity` that accepts the Markdown string, runs it through `SemanticChunker.process()`, and returns the list of chunks.
 
-from app.services.chunker import ChunkerService
-from app.services.file_parser import ParsedDocument, RawParagraph
-
-
-@pytest.fixture
-def doc_with_paragraphs() -> ParsedDocument:
-    paragraphs = [
-        RawParagraph(
-            text="تعدّ ظاهرة الاقتصاد الإسلامي من أبرز الظواهر التي شهدها العالم.",
-            paragraph_index=0,
-            chapter="الفصل الأول",
-            section="المقدمة",
-        ),
-        RawParagraph(
-            text="يُعرَّف الاقتصاد الإسلامي بأنه العلم الذي يدرس السلوك وفق الشريعة.",
-            paragraph_index=1,
-            chapter="الفصل الأول",
-            section="الإطار النظري",
-        ),
-        RawParagraph(
-            text="The Islamic finance industry has grown significantly since the 1970s.",
-            paragraph_index=2,
-            chapter="Chapter Two",
-            section="Literature Review",
-        ),
-    ]
-    return ParsedDocument(paragraphs=paragraphs, file_format="md")
-
-
-@pytest.mark.asyncio
-async def test_chunk_enriches_language_hint(doc_with_paragraphs: ParsedDocument):
-    service = ChunkerService()
-    chunks = await service.chunk(doc_with_paragraphs)
-    assert len(chunks) == 3
-    ar_chunk = chunks[0]
-    en_chunk = chunks[2]
-    assert ar_chunk.language_hint == "ar"
-    assert en_chunk.language_hint == "en"
-
-
-@pytest.mark.asyncio
-async def test_chunk_preserves_chapter_section(doc_with_paragraphs: ParsedDocument):
-    service = ChunkerService()
-    chunks = await service.chunk(doc_with_paragraphs)
-    assert chunks[0].chapter_title == "الفصل الأول"
-    assert chunks[0].section_title == "المقدمة"
-
-
-@pytest.mark.asyncio
-async def test_chunk_estimates_tokens(doc_with_paragraphs: ParsedDocument):
-    service = ChunkerService()
-    chunks = await service.chunk(doc_with_paragraphs)
-    for chunk in chunks:
-        assert chunk.token_estimate > 0
-
-
-def test_detect_language_arabic():
-    from app.services.chunker import _detect_language
-    assert _detect_language("تعدّ هذه الدراسة محاولة جادة") == "ar"
-
-
-def test_detect_language_english():
-    from app.services.chunker import _detect_language
-    assert _detect_language("The study examines economic behavior") == "en"
-
-
-def test_detect_language_mixed():
-    from app.services.chunker import _detect_language
-    assert _detect_language("يرى الباحث أن GDP growth يعتمد على السياسة المالية") == "mixed"
-```
-
-- [ ] **Step 9.2: Run — expect FAIL**
-
-```bash
-python -m pytest tests/test_chunker.py -v 2>&1 | head -10
-```
-
-Expected: `ImportError: cannot import name 'ChunkerService'`
-
-- [ ] **Step 9.3: Create `backend/app/services/chunker.py`**
-
-```python
-import re
-from dataclasses import dataclass
-
-import httpx
-from tenacity import retry, stop_after_attempt, wait_exponential
-
-from app.config import settings
-from app.services.file_parser import ParsedDocument
-
-ARABIC_RANGE = re.compile(r"[؀-ۿݐ-ݿﭐ-﷿ﹰ-﻿]")
-LATIN_RANGE = re.compile(r"[a-zA-Z]")
-
-
-def _detect_language(text: str) -> str:
-    ar_count = len(ARABIC_RANGE.findall(text))
-    la_count = len(LATIN_RANGE.findall(text))
-    total = ar_count + la_count
-    if total == 0:
-        return "ar"
-    ar_ratio = ar_count / total
-    if ar_ratio >= 0.75:
-        return "ar"
-    if ar_ratio <= 0.25:
-        return "en"
-    return "mixed"
-
-
-def _estimate_tokens(text: str) -> int:
-    # Rough estimate: Arabic words tokenise at ~1.5 tokens each; Latin at ~1 token per 4 chars
-    words = text.split()
-    return max(1, int(len(words) * 1.3))
-
-
-@dataclass
-class ChunkData:
-    chapter_title: str | None
-    section_title: str | None
-    paragraph_index: int
-    text: str
-    language_hint: str
-    token_estimate: int
-
-
-class ChunkerService:
-    def __init__(self):
-        self._base_url = settings.ollama_base_url
-        self._model = settings.ollama_chunker_model
-
-    async def chunk(self, doc: ParsedDocument) -> list[ChunkData]:
-        """
-        For docx/md: paragraphs already have chapter/section from the parser.
-        We only call Ollama for txt files where structure is ambiguous.
-        For all formats: enrich with language detection and token estimates.
-        """
-        if doc.file_format == "txt" and len(doc.paragraphs) > 0:
-            return await self._chunk_with_ollama(doc)
-        return self._chunk_deterministic(doc)
-
-    def _chunk_deterministic(self, doc: ParsedDocument) -> list[ChunkData]:
-        return [
-            ChunkData(
-                chapter_title=p.chapter,
-                section_title=p.section,
-                paragraph_index=p.paragraph_index,
-                text=p.text,
-                language_hint=_detect_language(p.text),
-                token_estimate=_estimate_tokens(p.text),
-            )
-            for p in doc.paragraphs
-        ]
-
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-    async def _call_ollama(self, prompt: str) -> str:
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            response = await client.post(
-                f"{self._base_url}/api/generate",
-                json={
-                    "model": self._model,
-                    "prompt": prompt,
-                    "stream": False,
-                    "options": {"temperature": 0.1},
-                },
-            )
-            response.raise_for_status()
-            return response.json()["response"]
-
-    async def _chunk_with_ollama(self, doc: ParsedDocument) -> list[ChunkData]:
-        raw_text = "\n\n".join(p.text for p in doc.paragraphs)
-        prompt = f"""You are a structural document analyzer for Arabic academic texts.
-Split the following text into logical paragraphs. Identify chapter/section headings.
-
-Text:
-{raw_text}
-
-Return ONLY a JSON array. Each item must have:
-- "chapter": string or null
-- "section": string or null
-- "paragraph_index": integer
-- "text": the paragraph content
-
-JSON:"""
-
-        import json
-
-        try:
-            raw = await self._call_ollama(prompt)
-            json_str = raw.strip()
-            if "```" in json_str:
-                json_str = json_str.split("```")[1].lstrip("json").strip()
-            parsed = json.loads(json_str)
-        except Exception:
-            # Fallback to deterministic if Ollama fails/times out
-            return self._chunk_deterministic(doc)
-
-        return [
-            ChunkData(
-                chapter_title=item.get("chapter"),
-                section_title=item.get("section"),
-                paragraph_index=item.get("paragraph_index", idx),
-                text=item["text"],
-                language_hint=_detect_language(item["text"]),
-                token_estimate=_estimate_tokens(item["text"]),
-            )
-            for idx, item in enumerate(parsed)
-            if item.get("text", "").strip()
-        ]
-```
-
-- [ ] **Step 9.4: Run tests — expect PASS**
-
-The chunker tests use the deterministic path (md format), so no Ollama connection needed.
-
-```bash
-python -m pytest tests/test_chunker.py -v
-```
-
-Expected: all 6 tests PASS.
-
-- [ ] **Step 9.5: Commit**
-
-```bash
-git add app/services/chunker.py tests/test_chunker.py
-git commit -m "feat: add Qwen2.5 chunker service (Ollama + deterministic fallback)"
-```
+- [ ] **Step 9.3: Commit Chunker Updates**
+Commit the worker script to the external repository.
 
 ---
 
-## Task 10: Celery Setup & Chunking Task
+## Task 10: Temporal.io Setup & Chunking Workflow
 
 **Files:**
-- Create: `backend/app/tasks/celery_app.py`
-- Create: `backend/app/tasks/__init__.py`
-- Create: `backend/app/tasks/chunking.py`
-- Create: `backend/app/tasks/cleanup.py`
+- Create: `backend/app/workflows/session_workflow.py`
+- Create: `backend/app/workflows/activities.py`
+- Create: `backend/app/worker.py` (Main Repo Worker)
 
-- [ ] **Step 10.1: Create `backend/app/tasks/celery_app.py`**
+- [ ] **Step 10.1: Install Temporal SDK**
+`pip install temporalio`
 
-```python
-from celery import Celery
-from celery.schedules import crontab
+- [ ] **Step 10.2: Define Workflow and Activities**
+In `backend/app/workflows/session_workflow.py`, define `CritiqueSessionWorkflow`. It will orchestrate:
+1. `ParseDocumentActivity` (runs on Main Worker).
+2. `ChunkDocumentActivity` (runs on External Chunker Worker).
+3. Updating DB session status to `QUEUED` when chunks are returned.
 
-from app.config import settings
+- [ ] **Step 10.3: Update Upload Endpoint**
+In `app/api/upload.py`, replace the Celery `run_chunking_task.delay()` with Temporal client's `execute_workflow()`.
 
-celery_app = Celery(
-    "naqqad",
-    broker=settings.redis_url,
-    backend=settings.redis_url,
-    include=["app.tasks.chunking", "app.tasks.cleanup"],
-)
-
-celery_app.conf.update(
-    task_serializer="json",
-    result_serializer="json",
-    accept_content=["json"],
-    timezone="UTC",
-    task_routes={
-        "app.tasks.chunking.*": {"queue": "chunking"},
-        "app.tasks.cleanup.*": {"queue": "cleanup"},
-    },
-    beat_schedule={
-        "expire-sessions-every-hour": {
-            "task": "app.tasks.cleanup.delete_expired_sessions",
-            "schedule": crontab(minute=0),  # every hour at :00
-        }
-    },
-)
-```
-
-- [ ] **Step 10.2: Create `backend/app/tasks/chunking.py`**
-
-```python
-import asyncio
-import uuid
-
-from app.tasks.celery_app import celery_app
-
-
-@celery_app.task(name="app.tasks.chunking.run_chunking_task", bind=True, max_retries=3)
-def run_chunking_task(self, session_id: str):
-    asyncio.run(_async_run_chunking(session_id))
-
-
-async def _async_run_chunking(session_id: str):
-    from sqlalchemy import select
-
-    from app.database import AsyncSessionLocal
-    from app.models.chunk import Chunk
-    from app.models.session import CritiqueSession, SessionStatus, UploadedFile
-    from app.services.chunker import ChunkerService
-    from app.services.file_parser import parse_file
-    from app.services.storage import StorageService
-
-    storage = StorageService()
-    chunker = ChunkerService()
-    sid = uuid.UUID(session_id)
-
-    async with AsyncSessionLocal() as db:
-        session = await db.get(CritiqueSession, sid)
-        if not session:
-            return
-
-        session.status = SessionStatus.PARSING
-        await db.commit()
-
-        try:
-            result = await db.execute(
-                select(UploadedFile).where(UploadedFile.session_id == sid)
-            )
-            uploaded = result.scalar_one_or_none()
-            if not uploaded:
-                raise ValueError("No uploaded file for session")
-
-            content = await storage.download(uploaded.s3_key)
-            parsed_doc = await parse_file(content, uploaded.file_format)
-
-            uploaded.page_count_estimate = parsed_doc.estimated_pages
-            await db.commit()
-
-            chunk_data_list = await chunker.chunk(parsed_doc)
-
-            for cd in chunk_data_list:
-                chunk = Chunk(
-                    session_id=sid,
-                    chapter_title=cd.chapter_title,
-                    section_title=cd.section_title,
-                    paragraph_index=cd.paragraph_index,
-                    text=cd.text,
-                    language_hint=cd.language_hint,
-                    token_estimate=cd.token_estimate,
-                )
-                db.add(chunk)
-
-            # Detect dominant language and set on session
-            langs = [cd.language_hint for cd in chunk_data_list]
-            ar_count = langs.count("ar")
-            en_count = langs.count("en")
-            session.detected_language = "ar" if ar_count >= en_count else "en"
-            session.status = SessionStatus.QUEUED
-            await db.commit()
-
-        except Exception as exc:
-            session.status = SessionStatus.FAILED
-            await db.commit()
-            raise
-```
-
-- [ ] **Step 10.3: Create `backend/app/tasks/cleanup.py`**
-
-```python
-import asyncio
-from datetime import datetime, timezone
-
-from app.tasks.celery_app import celery_app
-
-
-@celery_app.task(name="app.tasks.cleanup.delete_expired_sessions")
-def delete_expired_sessions():
-    asyncio.run(_async_delete_expired())
-
-
-async def _async_delete_expired():
-    from sqlalchemy import select
-
-    from app.database import AsyncSessionLocal
-    from app.models.session import CritiqueSession, SessionStatus, UploadedFile
-    from app.services.storage import StorageService
-
-    storage = StorageService()
-    now = datetime.now(timezone.utc)
-
-    async with AsyncSessionLocal() as db:
-        result = await db.execute(
-            select(CritiqueSession).where(
-                CritiqueSession.expires_at <= now,
-                CritiqueSession.status != SessionStatus.EXPIRED,
-            )
-        )
-        expired_sessions = result.scalars().all()
-
-        for session in expired_sessions:
-            files_result = await db.execute(
-                select(UploadedFile).where(UploadedFile.session_id == session.id)
-            )
-            for uploaded in files_result.scalars().all():
-                try:
-                    await storage.delete(uploaded.s3_key)
-                except Exception:
-                    pass  # already deleted or missing — continue
-
-            session.status = SessionStatus.EXPIRED
-
-        await db.commit()
-```
-
-- [ ] **Step 10.4: Create `backend/app/tasks/__init__.py`**
-
-```python
-```
-
-(empty file)
-
-- [ ] **Step 10.5: Write integration test for chunking task**
-
-Add to `backend/tests/test_upload.py`:
-
-```python
-@pytest.mark.asyncio
-async def test_session_transitions_to_queued_after_chunking(async_client: AsyncClient):
-    """
-    Smoke test: upload a file and verify the session reaches QUEUED status
-    (chunking task runs synchronously in tests via eager mode).
-    """
-    from app.tasks import celery_app as ca
-    ca.celery_app.conf.task_always_eager = True  # run tasks synchronously in tests
-
-    token = await get_token(async_client)
-    content = (FIXTURES / "sample.md").read_bytes()
-
-    upload_response = await async_client.post(
-        "/sessions/upload",
-        headers={"Authorization": f"Bearer {token}"},
-        data={"tone": "constructive", "report_depth": "standard"},
-        files={"file": ("sample.md", io.BytesIO(content), "text/markdown")},
-    )
-    assert upload_response.status_code == 202
-    session_id = upload_response.json()["id"]
-
-    status_response = await async_client.get(
-        f"/sessions/{session_id}",
-        headers={"Authorization": f"Bearer {token}"},
-    )
-    assert status_response.status_code == 200
-    assert status_response.json()["status"] == "queued"
-    assert status_response.json()["detected_language"] == "ar"
-```
-
-- [ ] **Step 10.6: Run full test suite**
-
+- [ ] **Step 10.4: Commit**
 ```bash
-python -m pytest tests/ -v --tb=short
-```
-
-Expected: all tests PASS (Celery runs in eager/sync mode during tests).
-
-- [ ] **Step 10.7: Commit**
-
-```bash
-git add app/tasks/ tests/test_upload.py
-git commit -m "feat: add Celery chunking task (parse → chunk → update session status)"
+git add app/workflows/ app/api/upload.py app/worker.py
+git commit -m "feat: replace Celery with Temporal workflows for session processing"
 ```
 
 ---
@@ -2311,19 +1889,19 @@ git commit -m "feat: add TTL cleanup task tests — Phase 1 foundation complete"
 - [x] File upload docx/txt/md (no PDF) → Task 7
 - [x] AES-256 encryption at rest → Task 6
 - [x] S3 storage with TTL → Tasks 6 + 11
-- [x] Stage-1 chunker (Qwen2.5:7b via Ollama) → Task 9
-- [x] Celery async task queue → Task 10
+- [x] Stage-1 chunker integration (Temporal Worker in separate repo) → Task 9
+- [x] Temporal.io async task queue → Task 10
 - [x] Session status state machine → Task 10 + models
 - [x] 24-hour secure deletion → Task 11
 - [x] Session + chunk status API → Task 8
 - [x] Free tier page cap (constant in config) → upload.py (`max_file_size_mb`, `free_tier_max_pages` in settings)
 
 **Not in this plan (Phase 2+):**
-- Stage-2 critique (Gemini/Claude) → Plan 2
+- Stage-2 critique (Gemini/Claude) via Temporal & SSE → Plan 2
 - DSE protocol + jury assembly → Plan 2
 - PDF/HTML report generation → Plan 3
 - RTL web UI → Plan 4
-- Tap Payments billing → Plan 4
+- Lemon Squeezy / Polar.sh billing → Plan 4
 
 ---
 

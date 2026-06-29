@@ -17,11 +17,12 @@
 
 ## 1. المعمارية الموجهة بالخدمات والبروتوكولات (Service-Protocol Architecture)
 
-لقد تطورت معمارية SARA لتنتقل من نظام تحليل ثابت إلى **محرك سير عمل وكيل (Agentic Workflow Engine)** يعتمد على الفصل التام بين "الخدمة" و "البروتوكول".
+لقد تطورت معمارية SARA لتنتقل من نظام تحليل ثابت إلى **محرك سير عمل وكيل (Agentic Workflow Engine)** يعتمد على الفصل التام بين "الخدمة" و "البروتوكول". يتم إدارة سير العمل والربط بين الخدمات باستخدام **Temporal.io** كبديل قوي لـ Celery لضمان الاعتمادية والبث المباشر.
 
-### 1.1 الهيكل الهجين (Hybrid Structure)
+### 1.1 الهيكل الهجين والموزع (Hybrid & Distributed Structure)
 *   **الخدمة (Service)**: هي المنتج النهائي الذي يراه المستخدم (مثل "نقد رسالة دكتوراة"). تحتوي على شروط المرفقات، التكلفة، ومعرف البروتوكول المرتبط.
 *   **البروتوكول (Protocol)**: هو "العقل البرمجي" المصمم بصرياً أو عبر JSON. يتكون من سلسلة من العقد (Nodes) التي تنفذ مهاماً محددة وتتخذ قرارات توجيهية بناءً على مخرجات AI.
+*   **مشغلات المهام الموزعة (Distributed Workers - Temporal)**: بدلاً من دمج جميع الخدمات في تطبيق واحد، يتم فصل المكونات الثقيلة (مثل `semantic_chunker`) لتعمل كـ Temporal Workers مستقلة (Microservices) تستمع إلى طوابير مهام (Task Queues) مخصصة لتنفيذ المهام الموكلة إليها.
 
 ---
 
@@ -67,6 +68,15 @@
 
 ---
 
+## 5. استراتيجية البث المباشر (Live SSE Streaming Strategy)
+
+لتوفير تجربة (Live Critique) مباشرة وفعالة للمستخدم دون تحميل Temporal بأحداث كثيفة التردد (High-Frequency Events):
+1.  **الأنشطة الموجهة للأحداث (Event-Driven Activities)**: تقوم الأنشطة (Temporal Activities) المسؤولة عن التواصل مع نماذج LLM ببث المخرجات لحظة بلحظة (Tokens/JSON chunks) إلى قناة في **Redis Pub/Sub**.
+2.  **واجهة البث (SSE Endpoint)**: يقوم خادم FastAPI بالاستماع إلى هذه القناة في Redis ويدفع البيانات مباشرة إلى المتصفح عبر (Server-Sent Events - SSE).
+3.  **تزامن الحالة (State Synchronization)**: بمجرد انتهاء النشاط من توليد النقد الكامل، يقوم بإرجاع النتيجة النهائية إلى مسار عمل Temporal (Workflow) لحفظ الحالة النهائية بشكل دائم (Durability) وتحديث قاعدة البيانات.
+
+---
+
 ## 5. تصميم قاعدة البيانات المطور (Extended ERD)
 
 ### 5.1 جداول المحرك (Engine Tables)
@@ -88,9 +98,10 @@
 ## 6. المسار التقني للتنفيذ (Implementation Roadmap v2)
 
 1.  **CORE-PARSER**: تطوير المحلل الهيدروليكي (Headings-Aware Parser).
-2.  **AGENT-RUNNER**: بناء مفسر الـ JSON (Interpreter) الذي ينفذ عقد البروتوكول.
-3.  **VISUAL-BUILDER**: واجهة React Flow لمنشئ البروتوكولات.
-4.  **INTEGRATION**: ربط المحرك بـ Gemini Context Caching.
+2.  **ORCHESTRATION**: إعداد Temporal.io لبناء مسارات العمل (Workflows) وإنشاء الـ Workers المنفصلة (بما في ذلك Chunker Worker في مستودع مستقل).
+3.  **AGENT-RUNNER**: بناء مفسر الـ JSON (Interpreter) الذي ينفذ عقد البروتوكول داخل أنشطة Temporal.
+4.  **VISUAL-BUILDER**: واجهة React Flow لمنشئ البروتوكولات.
+5.  **INTEGRATION & STREAMING**: ربط المحرك بـ Gemini Context Caching وتنفيذ البث المباشر عبر Redis Pub/Sub و SSE.
 
 ---
 *تم التحديث بواسطة SARA Architect - 31 ديسمبر 2025*
